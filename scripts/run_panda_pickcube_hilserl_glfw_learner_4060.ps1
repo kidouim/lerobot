@@ -19,8 +19,20 @@ if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyCon
     throw "Port $Port is already in use. Stop the previous learner first."
 }
 
+# TorchCodec on Windows requires the DLLs from a full shared FFmpeg build.
+$ffmpegInstall = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+    Where-Object { $_.DisplayName -like 'FFmpeg*' -and $_.InstallLocation } |
+    Select-Object -First 1
+if ($ffmpegInstall) {
+    $ffmpegBin = Get-ChildItem -LiteralPath $ffmpegInstall.InstallLocation -Directory -Filter 'ffmpeg-*-full_build-shared' -ErrorAction SilentlyContinue |
+        Select-Object -First 1 |
+        ForEach-Object { Join-Path $_.FullName 'bin' }
+    if ($ffmpegBin -and (Test-Path $ffmpegBin)) {
+        $env:PATH = "$ffmpegBin;$env:PATH"
+    }
+}
+
 $env:CUDA_VISIBLE_DEVICES = "0"
-$env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 $env:MUJOCO_GL = "glfw"
 $env:LEROBOT_HILSERL_PROFILE = "0"
 $env:LEROBOT_GYM_HIL_USE_VIEWER = "0"

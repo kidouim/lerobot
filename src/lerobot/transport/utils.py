@@ -18,7 +18,9 @@
 import io
 import json
 import logging
+import os
 import pickle  # nosec B403: Safe usage for internal serialization only
+import time
 from multiprocessing.synchronize import Event as MpEvent
 from queue import Queue
 from typing import Any
@@ -34,6 +36,7 @@ TransferState = services_pb2.TransferState  # type: ignore[attr-defined]
 
 CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB
 MAX_MESSAGE_SIZE = 4 * 1024 * 1024  # 4 MB
+_sent_transfer_counts: dict[str, int] = {}
 
 
 def bytes_buffer_size(buffer: io.BytesIO) -> int:
@@ -44,6 +47,7 @@ def bytes_buffer_size(buffer: io.BytesIO) -> int:
 
 
 def send_bytes_in_chunks(buffer: bytes, message_class: Any, log_prefix: str = "", silent: bool = True):
+    transfer_start = time.perf_counter()
     bytes_buffer: io.BytesIO = io.BytesIO(buffer)
     size_in_bytes = bytes_buffer_size(bytes_buffer)
 
@@ -69,11 +73,24 @@ def send_bytes_in_chunks(buffer: bytes, message_class: Any, log_prefix: str = ""
         logging_method(f"{log_prefix} Sent {sent_bytes}/{size_in_bytes} bytes with state {transfer_state}")
 
     logging_method(f"{log_prefix} Published {sent_bytes / 1024 / 1024} MB")
+    if os.getenv("LEROBOT_HILSERL_PROFILE") == "1":
+        count = _sent_transfer_counts.get(log_prefix, 0) + 1
+        _sent_transfer_counts[log_prefix] = count
+        if count % 5 == 0:
+            logging.info(
+                "%s [TRANSPORT][PERF] sent=%d size_mib=%.2f stream_ms=%.1f",
+                log_prefix,
+                count,
+                sent_bytes / 1024 / 1024,
+                (time.perf_counter() - transfer_start) * 1000,
+            )
 
 
 def receive_bytes_in_chunks(iterator, queue: Queue | None, shutdown_event: MpEvent, log_prefix: str = ""):
     bytes_buffer = io.BytesIO()
     step = 0
+    transfer_start = None
+    completed_transfers = 0
 
     logging.info(f"{log_prefix} Starting receiver")
     for item in iterator:
@@ -83,6 +100,7 @@ def receive_bytes_in_chunks(iterator, queue: Queue | None, shutdown_event: MpEve
             return
 
         if item.transfer_state == TransferState.TRANSFER_BEGIN:
+            transfer_start = time.perf_counter()
             bytes_buffer.seek(0)
             bytes_buffer.truncate(0)
             bytes_buffer.write(item.data)
@@ -97,9 +115,28 @@ def receive_bytes_in_chunks(iterator, queue: Queue | None, shutdown_event: MpEve
             logging.debug(f"{log_prefix} Received data at step end size {bytes_buffer_size(bytes_buffer)}")
 
             if queue is not None:
-                queue.put(bytes_buffer.getvalue())
+                if shutdown_event.is_set():
+                    logging.info(f"{log_prefix} Skipping completed transfer during shutdown")
+                    return
+                try:
+                    queue.put(bytes_buffer.getvalue())
+                except (OSError, ValueError):
+                    if shutdown_event.is_set():
+                        logging.info(f"{log_prefix} Queue closed during shutdown")
+                        return
+                    raise
             else:
                 return bytes_buffer.getvalue()
+
+            completed_transfers += 1
+            if completed_transfers % 5 == 0 and transfer_start is not None:
+                logging.info(
+                    "%s received %d payloads; latest %.2f MiB in %.3fs",
+                    log_prefix,
+                    completed_transfers,
+                    bytes_buffer_size(bytes_buffer) / 1024 / 1024,
+                    time.perf_counter() - transfer_start,
+                )
 
             bytes_buffer.seek(0)
             bytes_buffer.truncate(0)

@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import math
+import os
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from typing import Any
@@ -197,6 +199,17 @@ class SACAlgorithm(RLAlgorithm):
             TrainingStats with per-component losses and grad norms.
         """
         clip = self.config.grad_clip_norm
+        profile_enabled = os.getenv("LEROBOT_HILSERL_PROFILE") == "1" and self._device.type == "cuda"
+
+        def start_timer() -> float:
+            if profile_enabled:
+                torch.cuda.synchronize(self._device)
+            return time.perf_counter()
+
+        def elapsed_ms(start: float) -> float:
+            if profile_enabled:
+                torch.cuda.synchronize(self._device)
+            return (time.perf_counter() - start) * 1000
 
         for _ in range(self.config.utd_ratio - 1):
             batch = next(batch_iterator)
@@ -217,14 +230,20 @@ class SACAlgorithm(RLAlgorithm):
 
             self._update_target_networks()
 
+        sample_start = start_timer()
         batch = next(batch_iterator)
+        sample_ms = elapsed_ms(sample_start)
+        prepare_start = start_timer()
         fb = self._prepare_forward_batch(batch, include_complementary_info=False)
+        prepare_ms = elapsed_ms(prepare_start)
 
+        critic_start = start_timer()
         loss_critic = self._compute_loss_critic(fb)
         self.optimizers["critic"].zero_grad()
         loss_critic.backward()
         critic_grad = torch.nn.utils.clip_grad_norm_(self.critic_ensemble.parameters(), max_norm=clip).item()
         self.optimizers["critic"].step()
+        critic_ms = elapsed_ms(critic_start)
 
         stats = TrainingStats(
             losses={"loss_critic": loss_critic.item()},
@@ -232,6 +251,7 @@ class SACAlgorithm(RLAlgorithm):
         )
 
         if self.policy_config.num_discrete_actions is not None:
+            discrete_critic_start = start_timer()
             loss_dc = self._compute_loss_discrete_critic(fb)
             self.optimizers["discrete_critic"].zero_grad()
             loss_dc.backward()
@@ -239,10 +259,14 @@ class SACAlgorithm(RLAlgorithm):
                 self.policy.discrete_critic.parameters(), max_norm=clip
             ).item()
             self.optimizers["discrete_critic"].step()
+            discrete_critic_ms = elapsed_ms(discrete_critic_start)
             stats.losses["loss_discrete_critic"] = loss_dc.item()
             stats.grad_norms["discrete_critic"] = dc_grad
+        else:
+            discrete_critic_ms = 0.0
 
         if self._optimization_step % self.config.policy_update_freq == 0:
+            actor_start = start_timer()
             for _ in range(self.config.policy_update_freq):
                 loss_actor = self._compute_loss_actor(fb)
                 self.optimizers["actor"].zero_grad()
@@ -257,14 +281,30 @@ class SACAlgorithm(RLAlgorithm):
                 loss_temp.backward()
                 temp_grad = torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=clip).item()
                 self.optimizers["temperature"].step()
+            actor_ms = elapsed_ms(actor_start)
 
             stats.losses["loss_actor"] = loss_actor.item()
             stats.losses["loss_temperature"] = loss_temp.item()
             stats.grad_norms["actor"] = actor_grad
             stats.grad_norms["temperature"] = temp_grad
             stats.extra["temperature"] = self.temperature
+        else:
+            actor_ms = 0.0
 
+        target_start = start_timer()
         self._update_target_networks()
+        target_ms = elapsed_ms(target_start)
+        if profile_enabled:
+            stats.extra.update(
+                {
+                    "perf_sample_ms": sample_ms,
+                    "perf_prepare_ms": prepare_ms,
+                    "perf_critic_ms": critic_ms,
+                    "perf_discrete_critic_ms": discrete_critic_ms,
+                    "perf_actor_temperature_ms": actor_ms,
+                    "perf_target_ms": target_ms,
+                }
+            )
         self._optimization_step += 1
         return stats
 

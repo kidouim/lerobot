@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -320,13 +321,19 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
         use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else True
         gripper_penalty = cfg.processor.gripper.gripper_penalty if cfg.processor.gripper is not None else 0.0
 
-        env = gym.make(
-            f"gym_hil/{cfg.task}",
-            image_obs=True,
-            render_mode="human",
-            use_gripper=use_gripper,
-            gripper_penalty=gripper_penalty,
-        )
+        gym_kwargs = {
+            "image_obs": True,
+            "render_mode": os.getenv("LEROBOT_GYM_HIL_RENDER_MODE", "human"),
+            "use_gripper": use_gripper,
+            "gripper_penalty": gripper_penalty,
+        }
+        # These profile-only overrides leave the normal Keyboard environment unchanged.
+        if "LEROBOT_GYM_HIL_USE_VIEWER" in os.environ:
+            gym_kwargs["use_viewer"] = os.environ["LEROBOT_GYM_HIL_USE_VIEWER"] == "1"
+        if "LEROBOT_GYM_HIL_RESET_DELAY_SECONDS" in os.environ:
+            gym_kwargs["reset_delay_seconds"] = float(os.environ["LEROBOT_GYM_HIL_RESET_DELAY_SECONDS"])
+
+        env = gym.make(f"gym_hil/{cfg.task}", **gym_kwargs)
 
         return env, None
 

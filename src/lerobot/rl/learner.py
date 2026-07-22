@@ -117,6 +117,8 @@ from .learner_service import MAX_WORKERS, SHUTDOWN_TIMEOUT, LearnerService
 from .train_rl import TrainRLServerPipelineConfig
 from .trainer import RLTrainer
 
+PROFILE_LOG_INTERVAL = 20
+
 
 @parser.wrap()
 def train_cli(cfg: TrainRLServerPipelineConfig):
@@ -332,6 +334,16 @@ def add_actor_information_and_train(
     policy.train()
 
     algorithm = make_algorithm(cfg=cfg.algorithm, policy=policy)
+    if device.type == "cuda":
+        critic_ensemble = getattr(algorithm, "critic_ensemble", None)
+        critic_device = next(critic_ensemble.parameters()).device if critic_ensemble is not None else "n/a"
+        logging.info(
+            "[LEARNER] CUDA device=%s name=%s policy_device=%s critic_device=%s",
+            device,
+            torch.cuda.get_device_name(device),
+            next(policy.parameters()).device,
+            critic_device,
+        )
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -380,6 +392,10 @@ def add_actor_information_and_train(
     optimization_step = resume_optimization_step if resume_optimization_step is not None else 0
     algorithm.optimization_step = optimization_step
     interaction_step_shift = resume_interaction_step if resume_interaction_step is not None else 0
+    profile_updates = 0
+    profile_update_seconds = 0.0
+    profile_cuda_timing = os.getenv("LEROBOT_HILSERL_PROFILE") == "1" and device.type == "cuda"
+    profile_component_totals: dict[str, float] = {}
 
     dataset_repo_id = None
     if cfg.dataset is not None:
@@ -393,13 +409,19 @@ def add_actor_information_and_train(
             break
 
         # Process all available transitions to the replay buffer, send by the actor server
-        process_transitions(
+        received_transitions = process_transitions(
             transition_queue=transition_queue,
             replay_buffer=replay_buffer,
             offline_replay_buffer=offline_replay_buffer,
             dataset_repo_id=dataset_repo_id,
             shutdown_event=shutdown_event,
         )
+        if received_transitions:
+            logging.info(
+                "[LEARNER][FLOW] received=%d replay_buffer=%d",
+                received_transitions,
+                len(replay_buffer),
+            )
 
         # Process all available interaction messages sent by the actor server
         interaction_message = process_interaction_messages(
@@ -413,10 +435,14 @@ def add_actor_information_and_train(
         if len(replay_buffer) < online_step_before_learning:
             continue
 
-        time_for_one_optimization_step = time.time()
+        if profile_cuda_timing:
+            torch.cuda.synchronize(device)
+        time_for_one_optimization_step = time.perf_counter()
 
         # One training step (trainer owns data_mixer iterator; algorithm owns UTD loop)
         stats = trainer.training_step()
+        if profile_cuda_timing:
+            torch.cuda.synchronize(device)
 
         # Push policy to actors if needed
         if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
@@ -424,6 +450,10 @@ def add_actor_information_and_train(
             last_time_policy_pushed = time.time()
 
         training_infos = stats.to_log_dict()
+        if profile_cuda_timing:
+            for key, value in training_infos.items():
+                if key.startswith("perf_") and isinstance(value, (int, float)):
+                    profile_component_totals[key] = profile_component_totals.get(key, 0.0) + value
 
         # Log training metrics at specified intervals
         optimization_step = algorithm.optimization_step
@@ -438,8 +468,10 @@ def add_actor_information_and_train(
                 wandb_logger.log_dict(d=training_infos, mode="train", custom_step_key="Optimization step")
 
         # Calculate and log optimization frequency
-        time_for_one_optimization_step = time.time() - time_for_one_optimization_step
+        time_for_one_optimization_step = time.perf_counter() - time_for_one_optimization_step
         frequency_for_one_optimization_step = 1 / (time_for_one_optimization_step + 1e-9)
+        profile_updates += 1
+        profile_update_seconds += time_for_one_optimization_step
 
         logging.info(f"[LEARNER] Optimization frequency loop [Hz]: {frequency_for_one_optimization_step}")
 
@@ -453,6 +485,32 @@ def add_actor_information_and_train(
                 mode="train",
                 custom_step_key="Optimization step",
             )
+
+        if profile_updates == PROFILE_LOG_INTERVAL:
+            losses = ", ".join(
+                f"{key}={value:.5f}"
+                for key, value in training_infos.items()
+                if "loss" in key.lower() and isinstance(value, (int, float))
+            )
+            perf = ", ".join(
+                f"{key.removeprefix('perf_')}={value / profile_updates:.1f}ms"
+                for key, value in profile_component_totals.items()
+            )
+            logging.info(
+                "[LEARNER][PERF] updates=%d ups=%.2f avg_update_ms=%.1f replay_buffer=%d "
+                "offline_buffer=%d gpu_mem_mib=%.0f %s %s",
+                optimization_step,
+                profile_updates / profile_update_seconds,
+                profile_update_seconds * 1000 / profile_updates,
+                len(replay_buffer),
+                len(offline_replay_buffer) if offline_replay_buffer is not None else 0,
+                torch.cuda.memory_allocated(device) / 1024 / 1024 if device.type == "cuda" else 0,
+                losses or "losses=unavailable",
+                perf or "component_timings=disabled",
+            )
+            profile_updates = 0
+            profile_update_seconds = 0.0
+            profile_component_totals = {}
 
         if optimization_step % log_freq == 0:
             logging.info(f"[LEARNER] Number of optimization step: {optimization_step}")
@@ -923,9 +981,28 @@ def push_actor_policy_to_queue(parameters_queue: Queue, algorithm: RLAlgorithm) 
     logging.debug("[LEARNER] Pushing actor policy to the queue")
 
     # Create a dictionary to hold all the state dicts
+    weights_start = time.perf_counter()
     state_dicts = algorithm.get_weights()
+    weights_s = time.perf_counter() - weights_start
+    serialize_start = time.perf_counter()
     state_bytes = state_to_bytes(state_dicts)
+    serialize_s = time.perf_counter() - serialize_start
+    queue_start = time.perf_counter()
     parameters_queue.put(state_bytes)
+    queue_s = time.perf_counter() - queue_start
+
+    if os.getenv("LEROBOT_HILSERL_PROFILE") == "1":
+        profile_count = getattr(push_actor_policy_to_queue, "_profile_count", 0) + 1
+        push_actor_policy_to_queue._profile_count = profile_count
+        if profile_count % 5 == 0:
+            logging.info(
+                "[LEARNER][POLICY_PUSH] count=%d size_mib=%.2f weights_ms=%.1f serialize_ms=%.1f queue_ms=%.1f",
+                profile_count,
+                len(state_bytes) / 1024 / 1024,
+                weights_s * 1000,
+                serialize_s * 1000,
+                queue_s * 1000,
+            )
 
 
 def process_interaction_message(
@@ -959,6 +1036,7 @@ def process_transitions(
         dataset_repo_id: Repository ID for dataset
         shutdown_event: Event to signal shutdown
     """
+    received_transitions = 0
     while not transition_queue.empty() and not shutdown_event.is_set():
         transition_list = transition_queue.get()
         transition_list = bytes_to_transitions(buffer=transition_list)
@@ -974,12 +1052,15 @@ def process_transitions(
                 continue
 
             replay_buffer.add(**transition)
+            received_transitions += 1
 
             # Add to offline buffer if it's an intervention
             if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
                 TeleopEvents.IS_INTERVENTION.value
             ):
                 offline_replay_buffer.add(**transition)
+
+    return received_transitions
 
 
 def process_interaction_messages(

@@ -114,6 +114,8 @@ from .gym_manipulator import (
 from .queue import get_last_item_from_queue
 from .train_rl import TrainRLServerPipelineConfig
 
+PROFILE_LOG_INTERVAL = 20
+
 # Main entry point
 
 
@@ -147,7 +149,11 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
     )
 
     logging.info("[ACTOR] Establishing connection with Learner")
-    if not establish_learner_connection(learner_client, shutdown_event):
+    learner_address = (
+        f"{cfg.policy.actor_learner_config.learner_host}:"
+        f"{cfg.policy.actor_learner_config.learner_port}"
+    )
+    if not establish_learner_connection(learner_client, shutdown_event, learner_address=learner_address):
         logging.error("[ACTOR] Failed to establish connection with Learner")
         return
 
@@ -207,10 +213,12 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
         logging.exception("[ACTOR] Unhandled exception in act_with_policy")
         shutdown_event.set()
     finally:
-        logging.info("[ACTOR] Closing queues")
-        transitions_queue.close()
-        interactions_queue.close()
-        parameters_queue.close()
+        logging.info("[ACTOR] Signaling communication processes to stop")
+        shutdown_event.set()
+        if grpc_channel is not None:
+            # Threads share this channel. Closing it unblocks a receive-policy
+            # stream when the learner has already stopped.
+            grpc_channel.close()
 
         transitions_process.join()
         logging.info("[ACTOR] Transitions process joined")
@@ -218,6 +226,11 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
         logging.info("[ACTOR] Interactions process joined")
         receive_policy_process.join()
         logging.info("[ACTOR] Receive policy process joined")
+
+        logging.info("[ACTOR] Closing queues")
+        transitions_queue.close()
+        interactions_queue.close()
+        parameters_queue.close()
 
         transitions_queue.cancel_join_thread()
         interactions_queue.cancel_join_thread()
@@ -279,6 +292,13 @@ def act_with_policy(
     )
     policy = policy.to(device).eval()
     assert isinstance(policy, nn.Module)
+    if device.type == "cuda":
+        logging.info(
+            "[ACTOR] CUDA device=%s name=%s policy_device=%s",
+            device,
+            torch.cuda.get_device_name(device),
+            next(policy.parameters()).device,
+        )
 
     # Build the algorithm
     algorithm = make_algorithm(cfg=cfg.algorithm, policy=policy)
@@ -299,6 +319,17 @@ def act_with_policy(
     episode_total_steps = 0
 
     policy_timer = TimerManager("Policy inference", log=False)
+    profile_totals = {
+        "observation": 0.0,
+        "preprocess": 0.0,
+        "inference": 0.0,
+        "postprocess": 0.0,
+        "env_step": 0.0,
+        "transition_queue": 0.0,
+        "control_step": 0.0,
+    }
+    profile_count = 0
+    profile_cuda_timing = os.getenv("LEROBOT_HILSERL_PROFILE") == "1" and device.type == "cuda"
 
     for interaction_step in range(cfg.policy.online_steps):
         start_time = time.perf_counter()
@@ -306,15 +337,28 @@ def act_with_policy(
             logging.info("[ACTOR] Shutting down act_with_policy")
             return
 
+        observation_start = time.perf_counter()
         observation = {
             k: v for k, v in transition[TransitionKey.OBSERVATION].items() if k in cfg.policy.input_features
         }
+        profile_totals["observation"] += time.perf_counter() - observation_start
 
         # Time policy inference and check if it meets FPS requirement
         with policy_timer:
+            preprocess_start = time.perf_counter()
             normalized_observation = preprocessor.process_observation(observation)
+            if profile_cuda_timing:
+                torch.cuda.synchronize(device)
+            profile_totals["preprocess"] += time.perf_counter() - preprocess_start
+            if profile_cuda_timing:
+                torch.cuda.synchronize(device)
+            policy_start = time.perf_counter()
             action = policy.select_action(batch=normalized_observation)
+            if profile_cuda_timing:
+                torch.cuda.synchronize(device)
+            profile_totals["inference"] += time.perf_counter() - policy_start
             # Unnormalize only the continuous part.
+            postprocess_start = time.perf_counter()
             if cfg.policy.num_discrete_actions is not None:
                 continuous_action = postprocessor.process_action(action[..., :-1])
                 discrete_action = action[..., -1:].to(
@@ -323,11 +367,13 @@ def act_with_policy(
                 action = torch.cat([continuous_action, discrete_action], dim=-1)
             else:
                 action = postprocessor.process_action(action)
+            profile_totals["postprocess"] += time.perf_counter() - postprocess_start
         policy_fps = policy_timer.fps_last
 
         log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
 
         # Use the new step function
+        env_step_start = time.perf_counter()
         new_transition = step_env_and_process_transition(
             env=online_env,
             transition=transition,
@@ -335,6 +381,8 @@ def act_with_policy(
             env_processor=env_processor,
             action_processor=action_processor,
         )
+        profile_totals["env_step"] += time.perf_counter() - env_step_start
+        profile_count += 1
 
         # Extract values from processed transition
         next_observation = {
@@ -389,10 +437,12 @@ def act_with_policy(
             update_policy_parameters(algorithm=algorithm, parameters_queue=parameters_queue, device=device)
 
             if len(list_transition_to_send_to_learner) > 0:
+                queue_start = time.perf_counter()
                 push_transitions_to_transport_queue(
                     transitions=list_transition_to_send_to_learner,
                     transitions_queue=transitions_queue,
                 )
+                profile_totals["transition_queue"] += time.perf_counter() - queue_start
                 list_transition_to_send_to_learner = []
 
             stats = get_frequency_stats(policy_timer)
@@ -427,6 +477,25 @@ def act_with_policy(
         if cfg.env.fps is not None:
             dt_time = time.perf_counter() - start_time
             precise_sleep(max(1 / cfg.env.fps - dt_time, 0.0))
+        profile_totals["control_step"] += time.perf_counter() - start_time
+
+        if profile_count == PROFILE_LOG_INTERVAL:
+            logging.info(
+                "[ACTOR][PERF] steps=%d preprocess=%.3fs inference=%.3fs "
+                "obs=%.3fs postprocess=%.3fs env_step=%.3fs transition_queue=%.3fs "
+                "control_step=%.3fs actual_fps=%.2f",
+                interaction_step + 1,
+                profile_totals["preprocess"] / profile_count,
+                profile_totals["inference"] / profile_count,
+                profile_totals["observation"] / profile_count,
+                profile_totals["postprocess"] / profile_count,
+                profile_totals["env_step"] / profile_count,
+                profile_totals["transition_queue"] / profile_count,
+                profile_totals["control_step"] / profile_count,
+                profile_count / profile_totals["control_step"],
+            )
+            profile_totals = {key: 0.0 for key in profile_totals}
+            profile_count = 0
 
 
 #  Communication Functions - Group all gRPC/messaging functions
@@ -436,6 +505,7 @@ def establish_learner_connection(
     stub: "services_pb2_grpc.LearnerServiceStub",
     shutdown_event: Any,  # Event
     attempts: int = 30,
+    learner_address: str = "the configured learner address",
 ) -> bool:
     """Establish a connection with the learner.
 
@@ -443,10 +513,11 @@ def establish_learner_connection(
         stub (services_pb2_grpc.LearnerServiceStub): The stub to use for the connection.
         shutdown_event (Event): The event to check if the connection should be established.
         attempts (int): The number of attempts to establish the connection.
+        learner_address (str): Address included in connection diagnostics.
     Returns:
         bool: True if the connection is established, False otherwise.
     """
-    for _ in range(attempts):
+    for attempt in range(attempts):
         if shutdown_event.is_set():
             logging.info("[ACTOR] Shutting down establish_learner_connection")
             return False
@@ -457,7 +528,16 @@ def establish_learner_connection(
             if stub.Ready(services_pb2.Empty()) == services_pb2.Empty():
                 return True
         except grpc.RpcError as e:
-            logging.error(f"[ACTOR] Waiting for Learner to be ready... {e}")
+            if e.code() == grpc.StatusCode.UNAVAILABLE:
+                logging.warning(
+                    "[ACTOR] Learner is not running yet at %s (attempt %d/%d). "
+                    "Start learner first or check the configured host/port.",
+                    learner_address,
+                    attempt + 1,
+                    attempts,
+                )
+            else:
+                logging.error(f"[ACTOR] Waiting for Learner to be ready... {e}")
             time.sleep(2)
     return False
 
@@ -532,7 +612,10 @@ def receive_policy(
         )
 
     except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
+        if shutdown_event.is_set():
+            logging.info("[ACTOR] Parameter stream stopped during shutdown")
+        else:
+            logging.error(f"[ACTOR] gRPC error: {e}")
 
     if not use_threads(cfg):
         grpc_channel.close()
@@ -586,7 +669,10 @@ def send_transitions(
             )
         )
     except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
+        if shutdown_event.is_set():
+            logging.info("[ACTOR] Transition stream stopped during shutdown")
+        else:
+            logging.error(f"[ACTOR] gRPC error: {e}")
 
     logging.info("[ACTOR] Finished streaming transitions")
 
@@ -645,7 +731,10 @@ def send_interactions(
             )
         )
     except grpc.RpcError as e:
-        logging.error(f"[ACTOR] gRPC error: {e}")
+        if shutdown_event.is_set():
+            logging.info("[ACTOR] Interaction stream stopped during shutdown")
+        else:
+            logging.error(f"[ACTOR] gRPC error: {e}")
 
     logging.info("[ACTOR] Finished streaming interactions")
 
@@ -702,7 +791,9 @@ def update_policy_parameters(algorithm: RLAlgorithm, parameters_queue: Queue, de
     bytes_state_dict = get_last_item_from_queue(parameters_queue, block=False)
     if bytes_state_dict is not None:
         logging.info("[ACTOR] Load new parameters from Learner.")
+        deserialize_start = time.perf_counter()
         state_dicts = bytes_to_state_dict(bytes_state_dict)
+        deserialize_s = time.perf_counter() - deserialize_start
 
         # TODO: check encoder parameter synchronization possible issues:
         # 1. When shared_encoder=True, we're loading stale encoder params from actor's state_dict
@@ -713,7 +804,24 @@ def update_policy_parameters(algorithm: RLAlgorithm, parameters_queue: Queue, de
         # - Send critic's encoder state when shared_encoder=True
         # - Skip encoder params entirely when freeze_vision_encoder=True
         # - Ensure discrete_critic gets correct encoder state (currently uses encoder_critic)
+        if device.type == "cuda" and os.getenv("LEROBOT_HILSERL_PROFILE") == "1":
+            torch.cuda.synchronize(device)
+        load_start = time.perf_counter()
         algorithm.load_weights(state_dicts, device=device)
+        if device.type == "cuda" and os.getenv("LEROBOT_HILSERL_PROFILE") == "1":
+            torch.cuda.synchronize(device)
+        load_s = time.perf_counter() - load_start
+
+        profile_count = getattr(update_policy_parameters, "_profile_count", 0) + 1
+        update_policy_parameters._profile_count = profile_count
+        if profile_count % 5 == 0:
+            logging.info(
+                "[ACTOR][POLICY_LOAD] count=%d size_mib=%.2f deserialize_ms=%.1f load_ms=%.1f",
+                profile_count,
+                len(bytes_state_dict) / 1024 / 1024,
+                deserialize_s * 1000,
+                load_s * 1000,
+            )
 
 
 #  Utilities functions

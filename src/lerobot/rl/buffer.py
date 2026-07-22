@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import functools
+import os
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -128,7 +129,12 @@ class ReplayBuffer:
 
         if image_augmentation_function is None:
             base_function = functools.partial(random_shift, pad=4)
-            self.image_augmentation_function = torch.compile(base_function)
+            # Windows Inductor startup can dominate the first learner update.
+            self.image_augmentation_function = (
+                base_function
+                if os.getenv("LEROBOT_HILSERL_DISABLE_TORCH_COMPILE") == "1"
+                else torch.compile(base_function)
+            )
         self.use_drq = use_drq
 
     def _initialize_storage(

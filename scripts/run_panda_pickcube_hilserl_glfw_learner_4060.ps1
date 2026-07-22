@@ -33,6 +33,7 @@ if ($ffmpegInstall) {
 }
 
 $env:CUDA_VISIBLE_DEVICES = "0"
+$env:LEROBOT_HILSERL_DISABLE_TORCH_COMPILE = "1"
 $env:MUJOCO_GL = "glfw"
 $env:LEROBOT_HILSERL_PROFILE = "0"
 $env:LEROBOT_GYM_HIL_USE_VIEWER = "0"

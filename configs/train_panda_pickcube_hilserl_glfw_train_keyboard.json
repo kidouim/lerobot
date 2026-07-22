@@ -90,7 +90,7 @@
     "image_embedding_pooling_dim": 8,
     "online_steps": 2000,
     "online_buffer_capacity": 2048,
-    "offline_buffer_capacity": 1024,
+    "offline_buffer_capacity": 4096,
     "async_prefetch": false,
     "online_step_before_learning": 32,
     "state_encoder_hidden_dim": 64,

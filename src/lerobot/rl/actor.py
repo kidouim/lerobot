@@ -213,17 +213,20 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
         logging.exception("[ACTOR] Unhandled exception in act_with_policy")
         shutdown_event.set()
     finally:
-        logging.info("[ACTOR] Signaling communication processes to stop")
-        shutdown_event.set()
-        if grpc_channel is not None:
-            # Threads share this channel. Closing it unblocks a receive-policy
-            # stream when the learner has already stopped.
-            grpc_channel.close()
-
+        logging.info("[ACTOR] Draining communication queues")
+        transitions_queue.put(None)
+        interactions_queue.put(None)
         transitions_process.join()
         logging.info("[ACTOR] Transitions process joined")
         interactions_process.join()
         logging.info("[ACTOR] Interactions process joined")
+
+        logging.info("[ACTOR] Signaling receive-policy process to stop")
+        shutdown_event.set()
+        if grpc_channel is not None:
+            # Threads share this channel. Close it only after the outbound
+            # streams have drained their queued transition payloads.
+            grpc_channel.close()
         receive_policy_process.join()
         logging.info("[ACTOR] Receive policy process joined")
 
@@ -508,6 +511,16 @@ def act_with_policy(
             profile_totals = {key: 0.0 for key in profile_totals}
             profile_count = 0
 
+    if list_transition_to_send_to_learner:
+        logging.info(
+            "[ACTOR] Flushing %d transitions from the final partial episode",
+            len(list_transition_to_send_to_learner),
+        )
+        push_transitions_to_transport_queue(
+            transitions=list_transition_to_send_to_learner,
+            transitions_queue=transitions_queue,
+        )
+
 
 #  Communication Functions - Group all gRPC/messaging functions
 
@@ -759,12 +772,18 @@ def transitions_stream(
     transitions_queue: Queue,
     timeout: float,
 ) -> "Generator[Any, None, services_pb2.Empty]":
-    while not shutdown_event.is_set():
+    while True:
         try:
             message = transitions_queue.get(block=True, timeout=timeout)
         except Empty:
+            if shutdown_event.is_set():
+                return services_pb2.Empty()
             logging.debug("[ACTOR] Transition queue is empty")
             continue
+
+        if message is None:
+            logging.info("[ACTOR] Transition queue drained")
+            return services_pb2.Empty()
 
         yield from send_bytes_in_chunks(
             message, services_pb2.Transition, log_prefix="[ACTOR] Send transitions"
@@ -778,12 +797,18 @@ def interactions_stream(
     interactions_queue: Queue,
     timeout: float,
 ) -> "Generator[Any, None, services_pb2.Empty]":
-    while not shutdown_event.is_set():
+    while True:
         try:
             message = interactions_queue.get(block=True, timeout=timeout)
         except Empty:
+            if shutdown_event.is_set():
+                return services_pb2.Empty()
             logging.debug("[ACTOR] Interaction queue is empty")
             continue
+
+        if message is None:
+            logging.info("[ACTOR] Interaction queue drained")
+            return services_pb2.Empty()
 
         yield from send_bytes_in_chunks(
             message,

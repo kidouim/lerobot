@@ -1,5 +1,7 @@
 param(
-    [string]$RunId = "panda_pickcube_glfw_$(Get-Date -Format 'MMdd_HHmmss')"
+    [string]$RunId = "panda_pickcube_glfw_$(Get-Date -Format 'MMdd_HHmmss')",
+    [switch]$Resume,
+    [string]$HistoricalInterventionsPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,8 +14,11 @@ $Port = 50051
 if (!(Test-Path $Python)) {
     throw "Python environment not found: $Python"
 }
-if (Test-Path $OutputDir) {
+if (!$Resume -and (Test-Path $OutputDir)) {
     throw "Refusing to overwrite existing output directory: $OutputDir"
+}
+if ($Resume -and !(Test-Path (Join-Path $OutputDir "checkpoints\last"))) {
+    throw "No checkpoint found for resume: $(Join-Path $OutputDir 'checkpoints\last')"
 }
 if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
     throw "Port $Port is already in use. Stop the previous learner first."
@@ -42,7 +47,18 @@ $env:LEROBOT_GYM_HIL_RESET_DELAY_SECONDS = "0"
 
 Write-Host "[LEARNER] config_path=$ConfigPath"
 Write-Host "[LEARNER] output_dir=$OutputDir"
+Write-Host "[LEARNER] resume=$Resume historical_interventions=$HistoricalInterventionsPath"
 Write-Host "[LEARNER] MUJOCO_GL=$env:MUJOCO_GL task=PandaPickCubeKeyboard-v0 fps=10 online_steps=2000"
 nvidia-smi
 
-& $Python -m lerobot.rl.learner --config_path $ConfigPath --output_dir $OutputDir
+$LearnerArgs = @("-m", "lerobot.rl.learner", "--config_path", $ConfigPath, "--output_dir", $OutputDir)
+if ($Resume) {
+    $LearnerArgs += "--resume=true"
+}
+if ($HistoricalInterventionsPath) {
+    if (!(Test-Path $HistoricalInterventionsPath)) {
+        throw "Historical intervention snapshot not found: $HistoricalInterventionsPath"
+    }
+    $LearnerArgs += "--historical_interventions_path=$HistoricalInterventionsPath"
+}
+& $Python @LearnerArgs

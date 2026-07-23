@@ -59,6 +59,66 @@ def create_empty_replay_buffer(
     )
 
 
+def test_replay_snapshot_round_trip_preserves_ring_layout(tmp_path):
+    buffer = ReplayBuffer(
+        capacity=4,
+        device="cpu",
+        storage_device="cpu",
+        state_keys=[OBS_STATE],
+        optimize_memory=True,
+        use_drq=False,
+    )
+    for value in range(3):
+        buffer.add(
+            state={OBS_STATE: torch.tensor([[float(value)]])},
+            action=torch.tensor([[float(value)]]),
+            reward=float(value),
+            next_state={OBS_STATE: torch.tensor([[float(value + 1)]])},
+            done=False,
+            truncated=False,
+            complementary_info={"is_intervention": bool(value % 2)},
+        )
+
+    snapshot_path = tmp_path / "replay.pt"
+    buffer.save_snapshot(snapshot_path)
+    restored = ReplayBuffer.load_snapshot(snapshot_path, device="cpu", storage_device="cpu")
+
+    assert restored.capacity == buffer.capacity
+    assert restored.position == buffer.position
+    assert restored.size == buffer.size
+    assert torch.equal(restored.states[OBS_STATE], buffer.states[OBS_STATE])
+    assert torch.equal(restored.actions, buffer.actions)
+
+
+def test_intervention_archive_preserves_explicit_next_state(tmp_path):
+    archive_path = tmp_path / "interventions.pt"
+    transitions = [
+        {
+            "state": {OBS_STATE: torch.tensor([[1.0]])},
+            ACTION: torch.tensor([[0.0]]),
+            "reward": 1.0,
+            "next_state": {OBS_STATE: torch.tensor([[2.0]])},
+            "done": False,
+            "truncated": False,
+            "complementary_info": {"is_intervention": True},
+        }
+    ]
+    ReplayBuffer.save_interventions(archive_path, transitions)
+
+    restored = ReplayBuffer(
+        capacity=2,
+        device="cpu",
+        storage_device="cpu",
+        state_keys=[OBS_STATE],
+        optimize_memory=False,
+        use_drq=False,
+    )
+    for transition in ReplayBuffer.load_interventions(archive_path):
+        restored.add(**transition)
+
+    assert torch.equal(restored.next_states[OBS_STATE][0], torch.tensor([2.0]))
+
+
 def create_random_image() -> torch.Tensor:
     return torch.rand(3, 84, 84)
 

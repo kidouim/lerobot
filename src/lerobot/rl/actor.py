@@ -200,8 +200,9 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
     interactions_process.start()
     receive_policy_process.start()
 
+    completed_transitions = None
     try:
-        act_with_policy(
+        completed_transitions = act_with_policy(
             cfg=cfg,
             shutdown_event=shutdown_event,
             parameters_queue=parameters_queue,
@@ -215,9 +216,26 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
     finally:
         logging.info("[ACTOR] Draining communication queues")
         transitions_queue.put(None)
-        interactions_queue.put(None)
         transitions_process.join()
         logging.info("[ACTOR] Transitions process joined")
+
+        # Send completion only after SendTransitions has returned. This lets the
+        # learner prove that its local queue contains the actor's complete run
+        # before it writes the final checkpoint and exits.
+        if completed_transitions is not None and not shutdown_event.is_set():
+            interactions_queue.put(
+                python_object_to_bytes(
+                    {
+                        "Actor finished": True,
+                        "Transitions sent": completed_transitions,
+                        "Interaction step": completed_transitions - 1,
+                    }
+                )
+            )
+            logging.info(
+                "[ACTOR][DRAIN] sent completion marker transitions=%d", completed_transitions
+            )
+        interactions_queue.put(None)
         interactions_process.join()
         logging.info("[ACTOR] Interactions process joined")
 
@@ -338,7 +356,7 @@ def act_with_policy(
         start_time = time.perf_counter()
         if shutdown_event.is_set():
             logging.info("[ACTOR] Shutting down act_with_policy")
-            return
+            return None
 
         observation_start = time.perf_counter()
         observation = {
@@ -520,6 +538,7 @@ def act_with_policy(
             transitions=list_transition_to_send_to_learner,
             transitions_queue=transitions_queue,
         )
+    return cfg.policy.online_steps
 
 
 #  Communication Functions - Group all gRPC/messaging functions
@@ -697,6 +716,9 @@ def send_transitions(
             logging.info("[ACTOR] Transition stream stopped during shutdown")
         else:
             logging.error(f"[ACTOR] gRPC error: {e}")
+            # A completion marker would be unsafe after a failed stream: the
+            # learner must not mistake a partial run for a fully drained one.
+            shutdown_event.set()
 
     logging.info("[ACTOR] Finished streaming transitions")
 

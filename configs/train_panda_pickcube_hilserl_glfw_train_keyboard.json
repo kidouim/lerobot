@@ -7,8 +7,8 @@
   "batch_size": 32,
   "steps": 2000,
   "log_freq": 10,
-  "save_checkpoint": false,
-  "save_freq": 500,
+  "save_checkpoint": true,
+  "save_freq": 100000,
   "wandb": {
     "enable": false,
     "project": "panda_pickcube_hilserl",
@@ -43,6 +43,7 @@
   },
   "mixer": "online_offline",
   "online_ratio": 0.5,
+  "historical_interventions_path": null,
   "policy": {
     "type": "gaussian_actor",
     "push_to_hub": false,

@@ -95,7 +95,7 @@ def test_update_last_checkpoint(tmp_path):
     checkpoint.mkdir()
     update_last_checkpoint(checkpoint)
     last_checkpoint = tmp_path / LAST_CHECKPOINT_LINK
-    assert last_checkpoint.is_symlink()
+    assert last_checkpoint.exists()
     assert last_checkpoint.resolve() == checkpoint
 
 

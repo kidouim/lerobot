@@ -40,6 +40,11 @@ class TrainRLServerPipelineConfig(TrainPipelineConfig):
     # Fraction sampled from online replay when using OnlineOfflineMixer.
     online_ratio: float = 0.5
 
+    # Optional intervention-only replay snapshot from a previous completed run.
+    # Fresh runs append it to the original demonstration buffer; resumed runs
+    # always restore their exact offline snapshot instead.
+    historical_interventions_path: str | None = None
+
     def validate(self) -> None:
         super().validate()
 

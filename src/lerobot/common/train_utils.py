@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import platform
+import subprocess
 from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
@@ -86,8 +88,30 @@ def update_last_checkpoint(checkpoint_dir: Path) -> Path:
     last_checkpoint_dir = checkpoint_dir.parent / LAST_CHECKPOINT_LINK
     if last_checkpoint_dir.is_symlink():
         last_checkpoint_dir.unlink()
+    elif last_checkpoint_dir.exists():
+        # On Windows this can be a directory junction created below. ``rmdir``
+        # removes the junction itself and refuses a non-empty real directory.
+        last_checkpoint_dir.rmdir()
     relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
-    last_checkpoint_dir.symlink_to(relative_target)
+    try:
+        last_checkpoint_dir.symlink_to(relative_target, target_is_directory=True)
+    except OSError:
+        if platform.system() != "Windows":
+            raise
+        # Native Windows often denies unprivileged symbolic-link creation.
+        # A directory junction has the same path semantics for resume and does
+        # not require Developer Mode or an elevated shell.
+        result = subprocess.run(
+            ["cmd.exe", "/c", "mklink", "/J", str(last_checkpoint_dir), str(checkpoint_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not create last checkpoint link at {last_checkpoint_dir}: {result.stderr.strip()}"
+            )
+    return last_checkpoint_dir
 
 
 def save_checkpoint(

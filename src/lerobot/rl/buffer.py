@@ -19,7 +19,8 @@ import os
 import threading
 from collections.abc import Callable, Sequence
 from contextlib import suppress
-from typing import TypedDict
+from pathlib import Path
+from typing import Any, TypedDict
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -194,6 +195,126 @@ class ReplayBuffer:
 
     def __len__(self):
         return self.size
+
+    def save_snapshot(self, path: str | Path) -> None:
+        """Save the complete circular buffer without converting images to a dataset.
+
+        The snapshot keeps the allocated ring layout, including ``position``.  This
+        matters when a training run is resumed: serialising only chronological rows
+        would silently change which slot is overwritten by the next transition.
+        """
+        with self._lock:
+            snapshot: dict[str, Any] = {
+                "format_version": 1,
+                "capacity": self.capacity,
+                "position": self.position,
+                "size": self.size,
+                "initialized": self.initialized,
+                "optimize_memory": self.optimize_memory,
+                "state_keys": list(self.state_keys),
+                "use_drq": self.use_drq,
+                "episode_ends": self.episode_ends.detach().cpu().clone(),
+            }
+            if self.initialized:
+                snapshot.update(
+                    {
+                        "states": {
+                            key: value.detach().cpu().clone() for key, value in self.states.items()
+                        },
+                        "actions": self.actions.detach().cpu().clone(),
+                        "rewards": self.rewards.detach().cpu().clone(),
+                        "dones": self.dones.detach().cpu().clone(),
+                        "truncateds": self.truncateds.detach().cpu().clone(),
+                        "has_complementary_info": self.has_complementary_info,
+                        "complementary_info_keys": list(self.complementary_info_keys),
+                        "complementary_info": {
+                            key: value.detach().cpu().clone()
+                            for key, value in self.complementary_info.items()
+                        },
+                    }
+                )
+                if not self.optimize_memory:
+                    snapshot["next_states"] = {
+                        key: value.detach().cpu().clone() for key, value in self.next_states.items()
+                    }
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        torch.save(snapshot, temporary_path)
+        os.replace(temporary_path, path)
+
+    @classmethod
+    def load_snapshot(
+        cls,
+        path: str | Path,
+        *,
+        device: str,
+        storage_device: str,
+        image_augmentation_function: Callable | None = None,
+    ) -> "ReplayBuffer":
+        """Restore a replay snapshot created by :meth:`save_snapshot`."""
+        snapshot = torch.load(Path(path), map_location="cpu", weights_only=True)
+        if snapshot.get("format_version") != 1:
+            raise ValueError(f"Unsupported replay snapshot format in {path}")
+
+        replay_buffer = cls(
+            capacity=int(snapshot["capacity"]),
+            device=device,
+            storage_device=storage_device,
+            state_keys=snapshot.get("state_keys", []),
+            image_augmentation_function=image_augmentation_function,
+            use_drq=bool(snapshot.get("use_drq", True)),
+            optimize_memory=bool(snapshot["optimize_memory"]),
+        )
+        replay_buffer.position = int(snapshot["position"])
+        replay_buffer.size = int(snapshot["size"])
+        replay_buffer.initialized = bool(snapshot["initialized"])
+        replay_buffer.episode_ends = snapshot["episode_ends"].to(storage_device)
+
+        if not replay_buffer.initialized:
+            return replay_buffer
+
+        replay_buffer.states = {key: value.to(storage_device) for key, value in snapshot["states"].items()}
+        replay_buffer.actions = snapshot["actions"].to(storage_device)
+        replay_buffer.rewards = snapshot["rewards"].to(storage_device)
+        replay_buffer.dones = snapshot["dones"].to(storage_device)
+        replay_buffer.truncateds = snapshot["truncateds"].to(storage_device)
+        replay_buffer.has_complementary_info = bool(snapshot.get("has_complementary_info", False))
+        replay_buffer.complementary_info_keys = list(snapshot.get("complementary_info_keys", []))
+        replay_buffer.complementary_info = {
+            key: value.to(storage_device) for key, value in snapshot.get("complementary_info", {}).items()
+        }
+
+        if replay_buffer.optimize_memory:
+            replay_buffer.next_states = replay_buffer.states
+        else:
+            replay_buffer.next_states = {
+                key: value.to(storage_device) for key, value in snapshot["next_states"].items()
+            }
+        return replay_buffer
+
+    @staticmethod
+    def save_interventions(path: str | Path, transitions: list[Transition]) -> int:
+        """Save explicit intervention transitions collected by the learner.
+
+        These records retain the actor-provided ``next_state`` even when the
+        main replay buffer uses its memory-optimised adjacent-state layout.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        torch.save({"format_version": 1, "transitions": transitions}, temporary_path)
+        os.replace(temporary_path, path)
+        return len(transitions)
+
+    @staticmethod
+    def load_interventions(path: str | Path) -> list[Transition]:
+        """Load intervention transitions saved by :meth:`save_interventions`."""
+        snapshot = torch.load(Path(path), map_location="cpu", weights_only=True)
+        if snapshot.get("format_version") != 1:
+            raise ValueError(f"Unsupported intervention snapshot format in {path}")
+        return snapshot["transitions"]
 
     def add(
         self,

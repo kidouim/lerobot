@@ -46,7 +46,6 @@ https://github.com/michel-aractingi/lerobot-hilserl-guide
 
 import logging
 import os
-import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -80,7 +79,7 @@ from lerobot.common.train_utils import (
 )
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import parser
-from lerobot.datasets import LeRobotDataset, make_dataset
+from lerobot.datasets import make_dataset
 from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.robots import so_follower  # noqa: F401
 from lerobot.teleoperators import gamepad, so_leader  # noqa: F401
@@ -104,6 +103,7 @@ from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.io_utils import load_json, write_json
 from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.random_utils import set_seed
+from lerobot.utils.transition import Transition
 from lerobot.utils.utils import (
     format_big_number,
     init_logging,
@@ -248,6 +248,7 @@ def start_learner_threads(
             parameters_queue=parameters_queue,
         )
         logging.info("[LEARNER] Training process stopped")
+        shutdown_event.set()
     except Exception:
         logging.exception("[LEARNER] Unhandled exception in training loop")
         shutdown_event.set()
@@ -307,7 +308,6 @@ def add_actor_information_and_train(
     device = get_safe_torch_device(try_device=cfg.policy.device, log=True)
     storage_device = get_safe_torch_device(try_device=cfg.policy.storage_device)
     online_step_before_learning = cfg.policy.online_step_before_learning
-    fps = cfg.env.fps
     log_freq = cfg.log_freq
     save_freq = cfg.save_freq
     policy_parameters_push_frequency = cfg.policy.actor_learner_config.policy_parameters_push_frequency
@@ -348,6 +348,11 @@ def add_actor_information_and_train(
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         dataset_stats=cfg.policy.dataset_stats,
+        pretrained_path=(
+            str(Path(cfg.output_dir) / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK / PRETRAINED_MODEL_DIR)
+            if cfg.resume
+            else None
+        ),
     )
 
     # Push initial policy weights to actors
@@ -396,6 +401,9 @@ def add_actor_information_and_train(
     profile_update_seconds = 0.0
     profile_cuda_timing = os.getenv("LEROBOT_HILSERL_PROFILE") == "1" and device.type == "cuda"
     profile_component_totals: dict[str, float] = {}
+    received_transition_count = 0
+    actor_finished_message: dict | None = None
+    intervention_transitions = initialize_intervention_archive(cfg)
 
     dataset_repo_id = None
     if cfg.dataset is not None:
@@ -414,12 +422,15 @@ def add_actor_information_and_train(
             replay_buffer=replay_buffer,
             offline_replay_buffer=offline_replay_buffer,
             dataset_repo_id=dataset_repo_id,
+            intervention_transitions=intervention_transitions,
             shutdown_event=shutdown_event,
         )
         if received_transitions:
+            received_transition_count += received_transitions
             logging.info(
-                "[LEARNER][FLOW] received=%d replay_buffer=%d",
+                "[LEARNER][FLOW] received=%d total_received=%d replay_buffer=%d",
                 received_transitions,
+                received_transition_count,
                 len(replay_buffer),
             )
 
@@ -430,6 +441,52 @@ def add_actor_information_and_train(
             wandb_logger=wandb_logger,
             shutdown_event=shutdown_event,
         )
+
+        if interaction_message is not None and interaction_message.get("Actor finished"):
+            actor_finished_message = interaction_message
+            expected_transitions = int(actor_finished_message["Transitions sent"])
+            logging.info(
+                "[LEARNER][DRAIN] actor completed expected_transitions=%d received_transitions=%d",
+                expected_transitions,
+                received_transition_count,
+            )
+
+        # The actor sends its completion message only after SendTransitions has
+        # returned, so matching counts proves the full transition stream reached
+        # this process. Stop here instead of continuing to optimize a frozen buffer.
+        if actor_finished_message is not None:
+            expected_transitions = int(actor_finished_message["Transitions sent"])
+            if received_transition_count < expected_transitions:
+                continue
+            if received_transition_count > expected_transitions:
+                logging.warning(
+                    "[LEARNER][DRAIN] received %d transitions, actor reported %d; saving received state",
+                    received_transition_count,
+                    expected_transitions,
+                )
+            if saving_checkpoint:
+                save_training_checkpoint(
+                    cfg=cfg,
+                    optimization_step=optimization_step,
+                    online_steps=online_steps,
+                    interaction_message=actor_finished_message,
+                    policy=policy,
+                    optimizers=optimizers,
+                    replay_buffer=replay_buffer,
+                    algorithm=algorithm,
+                    offline_replay_buffer=offline_replay_buffer,
+                    intervention_transitions=intervention_transitions,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                )
+            logging.info(
+                "[LEARNER][DRAIN] complete; stopping after actor stream drain "
+                "(online=%d offline=%d optimization_step=%d)",
+                len(replay_buffer),
+                len(offline_replay_buffer) if offline_replay_buffer is not None else 0,
+                optimization_step,
+            )
+            return
 
         # Wait until the replay buffer has enough samples to start training
         if len(replay_buffer) < online_step_before_learning:
@@ -516,7 +573,7 @@ def add_actor_information_and_train(
             logging.info(f"[LEARNER] Number of optimization step: {optimization_step}")
 
         # Save checkpoint at specified intervals
-        if saving_checkpoint and (optimization_step % save_freq == 0 or optimization_step == online_steps):
+        if saving_checkpoint and optimization_step % save_freq == 0:
             save_training_checkpoint(
                 cfg=cfg,
                 optimization_step=optimization_step,
@@ -527,8 +584,7 @@ def add_actor_information_and_train(
                 replay_buffer=replay_buffer,
                 algorithm=algorithm,
                 offline_replay_buffer=offline_replay_buffer,
-                dataset_repo_id=dataset_repo_id,
-                fps=fps,
+                intervention_transitions=intervention_transitions,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
             )
@@ -614,8 +670,7 @@ def save_training_checkpoint(
     replay_buffer: ReplayBuffer,
     algorithm: RLAlgorithm | None = None,
     offline_replay_buffer: ReplayBuffer | None = None,
-    dataset_repo_id: str | None = None,
-    fps: int = 30,
+    intervention_transitions: list[Transition] | None = None,
     preprocessor=None,
     postprocessor=None,
 ) -> None:
@@ -627,8 +682,8 @@ def save_training_checkpoint(
     2. Saves the policy model, configuration, and optimizer states
     3. Saves the current interaction step for resuming training
     4. Updates the "last" checkpoint symlink to point to this checkpoint
-    5. Saves the replay buffer as a dataset for later use
-    6. If an offline replay buffer exists, saves it as a separate dataset
+    5. Saves exact online/offline replay snapshots for lossless resume
+    6. Saves intervention transitions separately for an optional later run
 
     Args:
         cfg: Training configuration
@@ -639,8 +694,6 @@ def save_training_checkpoint(
         optimizers: Dictionary of optimizers
         replay_buffer: Replay buffer to save as dataset
         offline_replay_buffer: Optional offline replay buffer to save
-        dataset_repo_id: Repository ID for dataset
-        fps: Frames per second for dataset
         preprocessor: Optional preprocessor pipeline to save
         postprocessor: Optional postprocessor pipeline to save
     """
@@ -676,33 +729,32 @@ def save_training_checkpoint(
         training_state_dir / TRAINING_STEP,
     )
 
-    # Update the "last" symlink
-    update_last_checkpoint(checkpoint_dir)
-
-    # TODO : temporary save replay buffer here, remove later when on the robot
-    # We want to control this with the keyboard inputs
-    dataset_dir = os.path.join(cfg.output_dir, "dataset")
-    if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
-        shutil.rmtree(dataset_dir)
-
-    # Save dataset
-    # NOTE: Handle the case where the dataset repo id is not specified in the config
-    # eg. RL training without demonstrations data
-    repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
-    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
-
+    replay_dir = checkpoint_dir / "replay"
+    replay_buffer.save_snapshot(replay_dir / "online_replay.pt")
+    intervention_count = ReplayBuffer.save_interventions(
+        replay_dir / "interventions.pt", intervention_transitions or []
+    )
     if offline_replay_buffer is not None:
-        dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
-        if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
-            shutil.rmtree(dataset_offline_dir)
+        offline_replay_buffer.save_snapshot(replay_dir / "offline_replay.pt")
 
-        offline_replay_buffer.to_lerobot_dataset(
-            cfg.dataset.repo_id,
-            fps=fps,
-            root=dataset_offline_dir,
-        )
-
-    logging.info("Resume training")
+    write_json(
+        {
+            "online_size": len(replay_buffer),
+            "offline_size": len(offline_replay_buffer) if offline_replay_buffer is not None else 0,
+            "intervention_count": intervention_count,
+        },
+        replay_dir / "manifest.json",
+    )
+    # Publish only after every component has reached disk, so ``last`` never
+    # points to a half-written replay snapshot.
+    update_last_checkpoint(checkpoint_dir)
+    logging.info(
+        "[LEARNER][CHECKPOINT] saved %s online=%d offline=%d interventions=%d",
+        checkpoint_dir,
+        len(replay_buffer),
+        len(offline_replay_buffer) if offline_replay_buffer is not None else 0,
+        intervention_count,
+    )
 
 
 # Training setup functions
@@ -762,6 +814,8 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
 
     # Ensure resume flag is set in returned config
     checkpoint_cfg.resume = True
+    checkpoint_cfg.output_dir = Path(out_dir)
+    checkpoint_cfg.policy.pretrained_path = Path(checkpoint_dir) / PRETRAINED_MODEL_DIR
     return checkpoint_cfg
 
 
@@ -820,8 +874,8 @@ def load_training_state(
         return step, interaction_step
 
     except Exception as e:
-        logging.error(f"Failed to load training state: {e}")
-        return None, None
+        logging.exception("Failed to load complete RL training state")
+        raise RuntimeError(f"Cannot safely resume from {checkpoint_dir}") from e
 
 
 def log_training_info(cfg: TrainRLServerPipelineConfig, policy: nn.Module) -> None:
@@ -865,24 +919,21 @@ def initialize_replay_buffer(
             optimize_memory=True,
         )
 
-    logging.info("Resume training load the online dataset")
-    dataset_path = os.path.join(cfg.output_dir, "dataset")
-
-    # NOTE: In RL is possible to not have a dataset.
-    repo_id = None
-    if cfg.dataset is not None:
-        repo_id = cfg.dataset.repo_id
-    dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=dataset_path,
-    )
-    return ReplayBuffer.from_lerobot_dataset(
-        lerobot_dataset=dataset,
-        capacity=cfg.policy.online_buffer_capacity,
+    snapshot_path = Path(cfg.output_dir) / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK / "replay" / "online_replay.pt"
+    if not snapshot_path.is_file():
+        raise FileNotFoundError(f"Missing online replay snapshot required for resume: {snapshot_path}")
+    logging.info("[LEARNER][RESUME] loading online replay snapshot from %s", snapshot_path)
+    replay_buffer = ReplayBuffer.load_snapshot(
+        snapshot_path,
         device=device,
-        state_keys=cfg.policy.input_features.keys(),
-        optimize_memory=True,
+        storage_device=storage_device,
     )
+    if replay_buffer.capacity != cfg.policy.online_buffer_capacity:
+        raise ValueError(
+            "online_buffer_capacity differs from the checkpoint snapshot "
+            f"({replay_buffer.capacity} != {cfg.policy.online_buffer_capacity})"
+        )
+    return replay_buffer
 
 
 def initialize_offline_replay_buffer(
@@ -901,27 +952,79 @@ def initialize_offline_replay_buffer(
     Returns:
         ReplayBuffer: Initialized offline replay buffer
     """
-    if not cfg.resume:
-        logging.info("make_dataset offline buffer")
-        offline_dataset = make_dataset(cfg)
-    else:
-        logging.info("load offline dataset")
-        dataset_offline_path = os.path.join(cfg.output_dir, "dataset_offline")
-        offline_dataset = LeRobotDataset(
-            repo_id=cfg.dataset.repo_id,
-            root=dataset_offline_path,
+    if cfg.resume:
+        snapshot_path = (
+            Path(cfg.output_dir) / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK / "replay" / "offline_replay.pt"
         )
+        if not snapshot_path.is_file():
+            raise FileNotFoundError(f"Missing offline replay snapshot required for resume: {snapshot_path}")
+        logging.info("[LEARNER][RESUME] loading offline replay snapshot from %s", snapshot_path)
+        offline_replay_buffer = ReplayBuffer.load_snapshot(
+            snapshot_path,
+            device=device,
+            storage_device=storage_device,
+        )
+        if offline_replay_buffer.capacity != cfg.policy.offline_buffer_capacity:
+            raise ValueError(
+                "offline_buffer_capacity differs from the checkpoint snapshot "
+                f"({offline_replay_buffer.capacity} != {cfg.policy.offline_buffer_capacity})"
+            )
+        return offline_replay_buffer
 
-    logging.info("Convert to a offline replay buffer")
+    logging.info("make_dataset offline buffer")
+    offline_dataset = make_dataset(cfg)
+    history_path = cfg.historical_interventions_path
+    # Intervention-only snapshots carry explicit next states. Preserve those
+    # exact pairs by using non-optimized storage for this optional fresh run.
+    optimize_memory = history_path is None
+    logging.info("Convert to an offline replay buffer")
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
         device=device,
         state_keys=cfg.policy.input_features.keys(),
         storage_device=storage_device,
-        optimize_memory=True,
+        optimize_memory=optimize_memory,
         capacity=cfg.policy.offline_buffer_capacity,
     )
+    if history_path is not None:
+        history_file = Path(history_path)
+        if not history_file.is_file():
+            raise FileNotFoundError(f"Historical intervention snapshot not found: {history_file}")
+        interventions = ReplayBuffer.load_interventions(history_file)
+        available_capacity = offline_replay_buffer.capacity - len(offline_replay_buffer)
+        if len(interventions) > available_capacity:
+            raise ValueError(
+                "Historical interventions do not fit in offline replay buffer "
+                f"({len(interventions)} > {available_capacity})"
+            )
+        for transition in interventions:
+            offline_replay_buffer.add(**transition)
+        logging.info(
+            "[LEARNER][OFFLINE] appended %d historical interventions from %s; offline_buffer=%d",
+            len(interventions),
+            history_file,
+            len(offline_replay_buffer),
+        )
     return offline_replay_buffer
+
+
+def initialize_intervention_archive(cfg: TrainRLServerPipelineConfig) -> list[Transition]:
+    """Restore archived interventions so a resumed run writes their union."""
+    archive_path = None
+    if cfg.resume:
+        archive_path = (
+            Path(cfg.output_dir) / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK / "replay" / "interventions.pt"
+        )
+    elif cfg.historical_interventions_path is not None:
+        archive_path = Path(cfg.historical_interventions_path)
+
+    if archive_path is None:
+        return []
+    if not archive_path.is_file():
+        raise FileNotFoundError(f"Intervention archive not found: {archive_path}")
+    interventions = ReplayBuffer.load_interventions(archive_path)
+    logging.info("[LEARNER][INTERVENTIONS] restored %d transitions from %s", len(interventions), archive_path)
+    return interventions
 
 
 # Utilities/Helpers functions
@@ -977,6 +1080,26 @@ def check_nan_in_transition(
     return nan_detected
 
 
+def copy_transition_to_cpu(transition: Transition) -> Transition:
+    """Detach an actor transition so it can be persisted independently."""
+    complementary_info = transition.get("complementary_info")
+    copied_complementary_info = None
+    if complementary_info is not None:
+        copied_complementary_info = {
+            key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
+            for key, value in complementary_info.items()
+        }
+    return Transition(
+        state={key: value.detach().cpu().clone() for key, value in transition["state"].items()},
+        action=transition[ACTION].detach().cpu().clone(),
+        reward=float(transition["reward"]),
+        next_state={key: value.detach().cpu().clone() for key, value in transition["next_state"].items()},
+        done=bool(transition["done"]),
+        truncated=bool(transition["truncated"]),
+        complementary_info=copied_complementary_info,
+    )
+
+
 def push_actor_policy_to_queue(parameters_queue: Queue, algorithm: RLAlgorithm) -> None:
     logging.debug("[LEARNER] Pushing actor policy to the queue")
 
@@ -1025,6 +1148,7 @@ def process_transitions(
     replay_buffer: ReplayBuffer,
     offline_replay_buffer: ReplayBuffer,
     dataset_repo_id: str | None,
+    intervention_transitions: list[Transition],
     shutdown_event: Any,  # Event
 ):
     """Process all available transitions from the queue.
@@ -1040,6 +1164,7 @@ def process_transitions(
     while not transition_queue.empty() and not shutdown_event.is_set():
         transition_list = transition_queue.get()
         transition_list = bytes_to_transitions(buffer=transition_list)
+        received_transitions += len(transition_list)
 
         for transition in transition_list:
             # Skip transitions with NaN values
@@ -1052,13 +1177,12 @@ def process_transitions(
                 continue
 
             replay_buffer.add(**transition)
-            received_transitions += 1
 
             # Add to offline buffer if it's an intervention
-            if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
-                TeleopEvents.IS_INTERVENTION.value
-            ):
-                offline_replay_buffer.add(**transition)
+            if transition.get("complementary_info", {}).get(TeleopEvents.IS_INTERVENTION.value):
+                intervention_transitions.append(copy_transition_to_cpu(transition))
+                if dataset_repo_id is not None and offline_replay_buffer is not None:
+                    offline_replay_buffer.add(**transition)
 
     return received_transitions
 
